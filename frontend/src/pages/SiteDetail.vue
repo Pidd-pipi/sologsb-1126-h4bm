@@ -18,8 +18,9 @@ import { FACTOR_META, NORMALIZE_LABELS } from '@/types/score'
 import { ASPECT_TYPES, SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
 import type { AspectType, AccessMode, SurfaceType } from '@/types/campsite'
 import type { Grade } from '@/utils/score'
-import type { RockfallRisk, WindDir, WindForce } from '@/types/factor'
+import type { FactorAssessment, RockfallRisk, WindDir, WindForce } from '@/types/factor'
 import { ROCKFALL_RISKS, WIND_DIRS, WIND_FORCES } from '@/types/factor'
+import type { AssessmentDiff } from '@/utils/factorHistory'
 import { VETO_TYPES, VETO_HINTS } from '@/types/veto'
 import type { VetoType } from '@/types/veto'
 import { formatDate, formatDateTime, todayIso } from '@/utils/format'
@@ -90,30 +91,69 @@ function prefillFactor(): void {
   factorForm.assessedAt = todayIso()
 }
 
-async function submitFactor(): Promise<void> {
+/** 依据当前表单组装一条待提交评估（轮次号由数据层按库内最新情况编排）。 */
+function buildFactorRecord(): FactorAssessment {
+  return {
+    siteId: siteId.value,
+    round: 0,
+    waterDistance: Number(factorForm.waterDistance),
+    windDir: factorForm.windDir,
+    windForce: factorForm.windForce,
+    signalBars: Number(factorForm.signalBars),
+    sunHours: Number(factorForm.sunHours),
+    rockfallRisk: factorForm.rockfallRisk,
+    shade: Number(factorForm.shade),
+    distanceToCar: Number(factorForm.distanceToCar),
+    distanceToTrail: Number(factorForm.distanceToTrail),
+    assessor: factorForm.assessor.trim() || '未署名',
+    assessedAt: factorForm.assessedAt || todayIso(),
+    createdAt: '',
+    updatedAt: ''
+  }
+}
+
+/* ---- 并发保护：两个页面同时提交同一营位时，晚到的一次先与库内最新一轮比对 ---- */
+const conflict = reactive({
+  visible: false,
+  diffs: [] as AssessmentDiff[],
+  latestDate: '',
+  latestAssessor: ''
+})
+
+async function submitFactor(force = false): Promise<void> {
   if (!site.value) return
   try {
-    await siteStore.addFactor({
-      siteId: siteId.value,
-      waterDistance: Number(factorForm.waterDistance),
-      windDir: factorForm.windDir,
-      windForce: factorForm.windForce,
-      signalBars: Number(factorForm.signalBars),
-      sunHours: Number(factorForm.sunHours),
-      rockfallRisk: factorForm.rockfallRisk,
-      shade: Number(factorForm.shade),
-      distanceToCar: Number(factorForm.distanceToCar),
-      distanceToTrail: Number(factorForm.distanceToTrail),
-      assessor: factorForm.assessor.trim() || '未署名',
-      assessedAt: factorForm.assessedAt || todayIso(),
-      createdAt: '',
-      updatedAt: ''
-    })
+    const result = await siteStore.submitFactor(buildFactorRecord(), { force })
+
+    // 库里已有更新或同日的一轮：本次不覆盖，列出差异由用户确认。
+    if (result.status === 'stale') {
+      conflict.diffs = result.diffs
+      conflict.latestDate = result.latest.assessedAt
+      conflict.latestAssessor = result.latest.assessor
+      conflict.visible = true
+      return
+    }
+
     showFactorForm.value = false
-    ElMessage.success('已追加一轮因子评估，名次与等级同步刷新')
+    conflict.visible = false
+    ElMessage.success(
+      `已留存第 ${result.round} 轮评估（${result.latest.assessedAt} · ${result.latest.assessor}），名次与等级立即重算`
+    )
   } catch (err) {
     ElMessage.error(`追加失败：${err instanceof Error ? err.message : String(err)}`)
   }
+}
+
+/** 看过差异后确认仍要追加：排为下一轮，不覆盖任何旧记录。 */
+async function confirmForceAppend(): Promise<void> {
+  conflict.visible = false
+  await submitFactor(true)
+}
+
+/** 放弃本次提交，回到表单修改（通常把评估日期改成最新再提交）。 */
+function cancelConflict(): void {
+  conflict.visible = false
+  ElMessage.info('未覆盖库内最新一轮，已保留本次填写内容供修改')
 }
 
 async function removeFactor(id: number | undefined): Promise<void> {
@@ -513,12 +553,48 @@ watch(
           </el-form-item>
         </div>
         <el-form-item>
-          <el-button type="primary" @click="submitFactor">提交本轮评估</el-button>
+          <el-button type="primary" @click="submitFactor(false)">提交本轮评估</el-button>
         </el-form-item>
       </el-form>
 
+      <!-- 晚到的一次评估：库内已有更新/同日的一轮，列差异待确认，默认不覆盖 -->
+      <el-dialog v-model="conflict.visible" title="库内已有更新的评估，请确认" width="640px">
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="`库内最新一轮为 ${conflict.latestDate}（评估人 ${conflict.latestAssessor}），本次评估日期不更新，尚未写入。`"
+          description="系统不会用本次内容覆盖最新一轮。请核对以下差异：确认无误可追加为下一轮（旧记录仍保留），或返回修改评估日期与数值。"
+        />
+        <el-table :data="conflict.diffs" size="small" border class="conflict-table">
+          <el-table-column prop="label" label="因子" width="130" />
+          <el-table-column label="库内最新一轮">
+            <template #default="{ row }">
+              <span class="diff-old">{{ row.oldValue }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="本次待提交" width="150">
+            <template #default="{ row }">
+              <span class="diff-new">{{ row.newValue }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p v-if="!conflict.diffs.length" class="panel__hint">两次评估各项数值完全一致，无需重复留存。</p>
+        <template #footer>
+          <el-button @click="cancelConflict">返回修改</el-button>
+          <el-button type="warning" @click="confirmForceAppend">确认追加为下一轮</el-button>
+        </template>
+      </el-dialog>
+
       <el-table v-if="factorHistory.length" :data="factorHistory" size="small" border>
-        <el-table-column label="序号" width="64" type="index" />
+        <el-table-column label="轮次" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.id === factorHistory[0]?.id" type="success" size="small" effect="dark">
+              第 {{ row.round }} 轮 · 当前计分
+            </el-tag>
+            <el-tag v-else size="small" effect="plain">第 {{ row.round }} 轮</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="assessedAt" label="评估日期" width="118">
           <template #default="{ row }">{{ formatDate(row.assessedAt) }}</template>
         </el-table-column>
@@ -646,5 +722,16 @@ watch(
 }
 .review-form {
   margin-bottom: 12px;
+}
+.conflict-table {
+  margin-top: 12px;
+}
+.diff-old {
+  color: var(--gb-muted);
+}
+.diff-new {
+  color: var(--gb-accent-strong);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 </style>

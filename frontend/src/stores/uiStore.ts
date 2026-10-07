@@ -10,10 +10,16 @@ import type { FactorWeights, NormalizeMethod, GradeThresholds } from '@/types/sc
 import { DEFAULT_WEIGHTS } from '@/types/score'
 import type { AccessMode, SurfaceType } from '@/types/campsite'
 import { nowIso, todayIso } from '@/utils/format'
+import { notifyDbChange, subscribeDbChange } from '@/utils/sync'
 
 export const useUiStore = defineStore('ui', () => {
   const vetos = ref<RiskVeto[]>([])
   const loadingVetos = ref(false)
+
+  // 其它标签页登记/解除否决后静默重载，保持名次表标红与等级短路同步。
+  subscribeDbChange((table) => {
+    if (table === 'vetos') void loadVetos()
+  })
 
   /** 名次表筛选条件 */
   const filterCamp = ref<string>('')
@@ -50,12 +56,14 @@ export const useUiStore = defineStore('ui', () => {
     }) as RiskVeto
     delete record.id
     const id = await db.vetos.add(record)
+    notifyDbChange('vetos')
     await loadVetos()
     return id
   }
 
   async function removeVeto(id: number): Promise<void> {
     await db.vetos.delete(id)
+    notifyDbChange('vetos')
     await loadVetos()
   }
 

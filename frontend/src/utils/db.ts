@@ -5,6 +5,8 @@
  *   v1 建 sites / factors 两张表
  *   v2 新增 profiles 表，并为 factors 补 siteId 索引
  *   v3 新增 vetos 表，并为存量营位回填默认权重方案
+ *   v4 因子评估改为「只追加、不覆盖」：为存量评估补 round 轮次号，
+ *      同一营位原有的那条（或多条）评估按时间排序后依次记为第 1、2、… 轮
  */
 import Dexie, { type Table } from 'dexie'
 import type { Campsite } from '@/types/campsite'
@@ -15,7 +17,7 @@ import type { RiskVeto } from '@/types/veto'
 
 export const DB_NAME = 'gbcampsite-db'
 /** 当前数据结构版本号 */
-export const DB_VERSION = 3
+export const DB_VERSION = 4
 
 export class GbCampsiteDatabase extends Dexie {
   sites!: Table<Campsite, number>
@@ -73,6 +75,39 @@ export class GbCampsiteDatabase extends Dexie {
             if (typeof s.flatness !== 'number') s.flatness = 70
             if (typeof s.tentCapacity !== 'number') s.tentCapacity = 1
           })
+      })
+
+    // v4：因子评估留痕。表结构不变（轮次号不建索引，按营位取数后内存排序），
+    // 仅为存量评估补 round：同一营位内按「评估日期→录入时间→id」排定第 1、2、… 轮。
+    this.version(DB_VERSION)
+      .stores({
+        sites: '++id, code, name, campName, surface, access, defaultProfileId, updatedAt',
+        factors: '++id, siteId, assessedAt, assessor',
+        profiles: '++id, name, season, active, updatedAt',
+        vetos: '++id, siteId, type, judgedAt'
+      })
+      .upgrade(async (tx) => {
+        const rows = (await tx.table('factors').toArray()) as FactorAssessment[]
+        const bySite = new Map<number, FactorAssessment[]>()
+        rows.forEach((f) => {
+          const list = bySite.get(f.siteId) ?? []
+          list.push(f)
+          bySite.set(f.siteId, list)
+        })
+        await Promise.all(
+          Array.from(bySite.values()).map(async (list) => {
+            // 按「评估日期→录入时间→id」从旧到新编号，最早一条即第 1 轮
+            const ordered = [...list].sort((a, b) => {
+              if (a.assessedAt !== b.assessedAt) return a.assessedAt < b.assessedAt ? -1 : 1
+              if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1
+              return (a.id ?? 0) - (b.id ?? 0)
+            })
+            ordered.forEach((f, idx) => {
+              f.round = idx + 1
+            })
+            await tx.table('factors').bulkPut(ordered)
+          })
+        )
       })
   }
 }
@@ -253,6 +288,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 1,
       siteId: 1,
+      round: 1,
       waterDistance: 45,
       windDir: '东南',
       windForce: 1,
@@ -268,6 +304,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 2,
       siteId: 2,
+      round: 1,
       waterDistance: 180,
       windDir: '南',
       windForce: 2,
@@ -283,6 +320,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 3,
       siteId: 3,
+      round: 1,
       waterDistance: 320,
       windDir: '西北',
       windForce: 4,
@@ -298,6 +336,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 4,
       siteId: 4,
+      round: 1,
       waterDistance: 260,
       windDir: '西',
       windForce: 1,
@@ -313,6 +352,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 5,
       siteId: 5,
+      round: 1,
       waterDistance: 210,
       windDir: '东北',
       windForce: 2,
@@ -328,6 +368,7 @@ function seedFactors(): FactorAssessment[] {
     {
       id: 6,
       siteId: 6,
+      round: 1,
       waterDistance: 8,
       windDir: '北',
       windForce: 3,

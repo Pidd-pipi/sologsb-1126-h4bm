@@ -178,6 +178,7 @@ const previewSite = computed<Campsite>(() => ({
 
 const previewFactor = computed<FactorAssessment>(() => ({
   siteId: 0,
+  round: 0,
   waterDistance: Number(factor.waterDistance),
   windDir: factor.windDir,
   windForce: factor.windForce,
@@ -272,6 +273,7 @@ async function submit(): Promise<void> {
     await siteStore.addFactor({
       ...factor,
       siteId: id,
+      round: 1,
       waterDistance: Number(factor.waterDistance),
       windForce: factor.windForce,
       signalBars: Number(factor.signalBars),
