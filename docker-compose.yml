@@ -1,0 +1,14 @@
+name: gbcampsite
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-gbcampsite}-frontend:latest
+    container_name: ${COMPOSE_PROJECT_NAME:-gbcampsite}-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-21826}:80"
+    environment:
+      - TZ=Asia/Shanghai
