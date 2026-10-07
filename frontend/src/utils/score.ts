@@ -4,7 +4,7 @@
  */
 import type { Campsite } from '@/types/campsite'
 import { ASPECT_SCORE } from '@/types/campsite'
-import type { FactorAssessment, RockfallRisk } from '@/types/factor'
+import type { FactorAssessmentInput, RockfallRisk } from '@/types/factor'
 import { ROCKFALL_SCORE } from '@/types/factor'
 import type { FactorKey, FactorMeta, FactorWeights, GradeThresholds, NormalizeMethod } from '@/types/score'
 import { FACTOR_META } from '@/types/score'
@@ -97,7 +97,7 @@ export function windScore(force: number): number {
 }
 
 /** 由营位 + 因子评估折算原始指标值；缺少评估记录时给保守缺省值。 */
-export function rawValuesOf(site: Campsite, factor?: FactorAssessment | null): RawFactorValues {
+export function rawValuesOf(site: Campsite, factor?: FactorAssessmentInput | null): RawFactorValues {
   return {
     slope: Number(site.slope) || 0,
     flatness: Number(site.flatness) || 0,

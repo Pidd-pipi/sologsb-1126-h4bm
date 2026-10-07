@@ -13,7 +13,7 @@ import { useProfileStore } from '@/stores/profileStore'
 import { useLocalDraft } from '@/hooks/useLocalDraft'
 import { ASPECT_TYPES, SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
 import type { AspectType, Campsite, SurfaceType, AccessMode } from '@/types/campsite'
-import type { FactorAssessment, RockfallRisk, WindDir, WindForce } from '@/types/factor'
+import type { FactorAssessmentInput, RockfallRisk, WindDir, WindForce } from '@/types/factor'
 import { ROCKFALL_RISKS, WIND_DIRS, WIND_FORCES } from '@/types/factor'
 import { FACTOR_META, DEFAULT_WEIGHTS } from '@/types/score'
 import type { FactorKey, FactorWeights } from '@/types/score'
@@ -176,7 +176,7 @@ const previewSite = computed<Campsite>(() => ({
   updatedAt: ''
 }))
 
-const previewFactor = computed<FactorAssessment>(() => ({
+const previewFactor = computed<FactorAssessmentInput>(() => ({
   siteId: 0,
   waterDistance: Number(factor.waterDistance),
   windDir: factor.windDir,

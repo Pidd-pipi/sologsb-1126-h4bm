@@ -4,7 +4,7 @@
  */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { db, toPlain } from '@/utils/db'
+import { db, notifyDataChange, onDataChange, toPlain } from '@/utils/db'
 import type { RiskVeto } from '@/types/veto'
 import type { FactorWeights, NormalizeMethod, GradeThresholds } from '@/types/score'
 import { DEFAULT_WEIGHTS } from '@/types/score'
@@ -40,6 +40,10 @@ export const useUiStore = defineStore('ui', () => {
     }
   }
 
+  onDataChange((event) => {
+    if (event.table === 'vetos') void loadVetos()
+  })
+
   async function addVeto(input: RiskVeto): Promise<number> {
     const now = nowIso()
     const record = toPlain({
@@ -51,12 +55,14 @@ export const useUiStore = defineStore('ui', () => {
     delete record.id
     const id = await db.vetos.add(record)
     await loadVetos()
+    notifyDataChange('vetos')
     return id
   }
 
   async function removeVeto(id: number): Promise<void> {
     await db.vetos.delete(id)
     await loadVetos()
+    notifyDataChange('vetos')
   }
 
   /** 某营位命中的全部否决项 */

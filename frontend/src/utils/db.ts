@@ -5,17 +5,32 @@
  *   v1 建 sites / factors 两张表
  *   v2 新增 profiles 表，并为 factors 补 siteId 索引
  *   v3 新增 vetos 表，并为存量营位回填默认权重方案
+ *   v4 为 factors 增加轮次序，旧评估作为第一次评估保留
  */
 import Dexie, { type Table } from 'dexie'
 import type { Campsite } from '@/types/campsite'
-import type { FactorAssessment } from '@/types/factor'
+import type { FactorAssessment, FactorAssessmentInput } from '@/types/factor'
+import { compareAssessments, diffFactorAssessments } from '@/types/factor'
 import type { ScoreProfile } from '@/types/score'
 import { DEFAULT_WEIGHTS } from '@/types/score'
 import type { RiskVeto } from '@/types/veto'
 
 export const DB_NAME = 'gbcampsite-db'
 /** 当前数据结构版本号 */
-export const DB_VERSION = 3
+export const DB_VERSION = 4
+
+export type AddFactorOutcome = 'added' | 'stale' | 'duplicate'
+
+export interface AddFactorResult {
+  outcome: AddFactorOutcome
+  id?: number
+  changedLatest: boolean
+  latest: FactorAssessment
+  differences: ReturnType<typeof diffFactorAssessments>
+}
+
+const DATA_CHANNEL_NAME = 'gbcampsite-data'
+let dataChannel: BroadcastChannel | null = null
 
 export class GbCampsiteDatabase extends Dexie {
   sites!: Table<Campsite, number>
@@ -53,7 +68,7 @@ export class GbCampsiteDatabase extends Dexie {
       })
 
     // v3：新增风险否决表；为存量营位回填默认方案 id 与新增字段缺省值
-    this.version(DB_VERSION)
+    this.version(3)
       .stores({
         sites: '++id, code, name, campName, surface, access, defaultProfileId, updatedAt',
         factors: '++id, siteId, assessedAt, assessor',
@@ -74,6 +89,34 @@ export class GbCampsiteDatabase extends Dexie {
             if (typeof s.tentCapacity !== 'number') s.tentCapacity = 1
           })
       })
+
+    // v4：因子评估按轮次追加，不再覆盖；原有那条评估升级为第 1 次。
+    this.version(DB_VERSION).stores({
+      sites: '++id, code, name, campName, surface, access, defaultProfileId, updatedAt',
+      factors: '++id, siteId, [siteId+sequence], assessedAt, assessor',
+      profiles: '++id, name, season, active, updatedAt',
+      vetos: '++id, siteId, type, judgedAt'
+    }).upgrade(async (tx) => {
+      const factors = (await tx.table('factors').toArray()) as FactorAssessment[]
+      const bySite = new Map<number, FactorAssessment[]>()
+      for (const factor of factors) {
+        const rows = bySite.get(factor.siteId) ?? []
+        rows.push(factor)
+        bySite.set(factor.siteId, rows)
+      }
+
+      for (const rows of bySite.values()) {
+        rows.sort((a, b) => {
+          if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1
+          return (a.id ?? 0) - (b.id ?? 0)
+        })
+        for (const [index, factor] of rows.entries()) {
+          if (typeof factor.id === 'number') {
+            await tx.table('factors').update(factor.id, { sequence: index + 1 })
+          }
+        }
+      }
+    })
   }
 }
 
@@ -82,6 +125,90 @@ export const db = new GbCampsiteDatabase()
 /** 写入前脱掉 Vue 响应式 Proxy，避免结构化克隆抛 DataCloneError。 */
 export function toPlain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
+}
+
+export type DataChangeTable = 'sites' | 'factors' | 'profiles' | 'vetos'
+
+export interface DataChangeEvent {
+  table: DataChangeTable
+}
+
+/** 通知同源其他页面：本地数据已变化，请重新读取。 */
+export function notifyDataChange(table: DataChangeTable): void {
+  if (typeof BroadcastChannel === 'undefined') return
+  dataChannel ??= new BroadcastChannel(DATA_CHANNEL_NAME)
+  dataChannel.postMessage({ table } satisfies DataChangeEvent)
+}
+
+/** 监听同源其他页面的数据变化（同一页面的操作由 store 自行 load）。 */
+export function onDataChange(handler: (event: DataChangeEvent) => void): () => void {
+  if (typeof BroadcastChannel === 'undefined') return () => undefined
+  dataChannel ??= new BroadcastChannel(DATA_CHANNEL_NAME)
+  const listener = (message: MessageEvent<DataChangeEvent>) => handler(message.data)
+  dataChannel.addEventListener('message', listener)
+  return () => dataChannel?.removeEventListener('message', listener)
+}
+
+/**
+ * 以事务执行“再次读取最新 → 比较 → 追加”，避免两个页面同时提交时互相覆盖。
+ * 日期不新于库中最新时默认不写入，只返回差异待确认；force 可保留为历史补录。
+ */
+export async function addFactorAssessment(
+  input: FactorAssessmentInput,
+  force = false
+): Promise<AddFactorResult> {
+  const record = toPlain({
+    ...input,
+    assessedAt: input.assessedAt || new Date().toISOString().slice(0, 10),
+    assessor: input.assessor.trim() || '未署名'
+  }) as FactorAssessmentInput
+
+  return db.transaction('rw', db.factors, async () => {
+    const existing = await db.factors.where('siteId').equals(record.siteId).toArray()
+    let latest: FactorAssessment | null = null
+    for (const item of existing) {
+      if (
+        !latest ||
+        item.assessedAt > latest.assessedAt ||
+        (item.assessedAt === latest.assessedAt && compareAssessments(item, latest) > 0)
+      ) {
+        latest = item
+      }
+    }
+
+    if (latest) {
+      const differences = diffFactorAssessments(record, latest)
+      const isDuplicate = record.assessedAt === latest.assessedAt && differences.length === 0
+      if (!force && (isDuplicate || record.assessedAt <= latest.assessedAt)) {
+        return {
+          outcome: isDuplicate ? 'duplicate' : 'stale',
+          changedLatest: false,
+          latest,
+          differences
+        }
+      }
+    }
+
+    const now = new Date().toISOString()
+    const maxSequence = existing.reduce((max, item) => Math.max(max, item.sequence ?? 0), 0)
+    const row: FactorAssessment = {
+      ...(record as FactorAssessment),
+      sequence: maxSequence + 1,
+      createdAt: now,
+      updatedAt: now
+    }
+    const id = await db.factors.add(row)
+    const saved = { ...row, id }
+    const previousLatest = latest
+    return {
+      outcome: 'added',
+      id,
+      changedLatest: !previousLatest || saved.assessedAt > previousLatest.assessedAt,
+      latest:
+        !previousLatest || saved.assessedAt > previousLatest.assessedAt ? saved : previousLatest,
+      differences: previousLatest ? diffFactorAssessments(saved, previousLatest) : []
+    }
+  })
 }
 
 /** 打开数据库；首次运行写入样例数据。 */
@@ -249,7 +376,7 @@ function seedSites(): Campsite[] {
 }
 
 function seedFactors(): FactorAssessment[] {
-  const rows: Array<Omit<FactorAssessment, 'createdAt' | 'updatedAt'>> = [
+  const rows: Array<Omit<FactorAssessment, 'createdAt' | 'updatedAt' | 'sequence'>> = [
     {
       id: 1,
       siteId: 1,
@@ -341,7 +468,17 @@ function seedFactors(): FactorAssessment[] {
       assessedAt: '2024-04-10'
     }
   ]
-  return rows.map((r) => ({ ...r, createdAt: SEED_TS, updatedAt: SEED_TS }))
+  const sequences = new Map<number, number>()
+  return rows.map((r) => {
+    const sequence = (sequences.get(r.siteId) ?? 0) + 1
+    sequences.set(r.siteId, sequence)
+    return {
+      ...r,
+      sequence,
+      createdAt: SEED_TS,
+      updatedAt: SEED_TS
+    }
+  })
 }
 
 function seedVetos(): RiskVeto[] {

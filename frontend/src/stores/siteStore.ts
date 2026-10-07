@@ -1,10 +1,19 @@
 /** 营位与因子评估的本地读写。写库前统一脱掉响应式 Proxy，避免 DataCloneError。 */
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { db, toPlain } from '@/utils/db'
+import {
+  addFactorAssessment,
+  db,
+  notifyDataChange,
+  onDataChange,
+  toPlain,
+  type AddFactorResult
+} from '@/utils/db'
 import type { Campsite } from '@/types/campsite'
-import type { FactorAssessment } from '@/types/factor'
-import { nextSerialNo, nowIso, todayIso } from '@/utils/format'
+import type { FactorAssessment, FactorAssessmentInput } from '@/types/factor'
+import { compareAssessments } from '@/types/factor'
+import { useUiStore } from '@/stores/uiStore'
+import { nextSerialNo, nowIso } from '@/utils/format'
 
 export const useSiteStore = defineStore('site', () => {
   const list = ref<Campsite[]>([])
@@ -23,6 +32,14 @@ export const useSiteStore = defineStore('site', () => {
     }
   }
 
+  /** 两个页面同时操作时，收到其他页面的提交后立即刷新内存中的名次依据。 */
+  onDataChange((event) => {
+    if (event.table === 'sites' || event.table === 'factors') void load()
+    if (event.table === 'sites' || event.table === 'vetos') {
+      useUiStore().loadVetos().catch(() => undefined)
+    }
+  })
+
   /** 生成下一个营位编号，如 CS-0007。 */
   function nextCode(): string {
     return nextSerialNo('CS-', list.value.map((s) => s.code))
@@ -34,12 +51,14 @@ export const useSiteStore = defineStore('site', () => {
     delete record.id
     const id = await db.sites.add(record)
     await load()
+    notifyDataChange('sites')
     return id
   }
 
   async function updateSite(id: number, patch: Partial<Campsite>): Promise<void> {
     await db.sites.update(id, toPlain({ ...patch, updatedAt: nowIso() }))
     await load()
+    notifyDataChange('sites')
   }
 
   async function removeSite(id: number): Promise<void> {
@@ -53,25 +72,25 @@ export const useSiteStore = defineStore('site', () => {
       .filter((v): v is number => typeof v === 'number')
     await db.vetos.bulkDelete(vetoIds)
     await load()
+    notifyDataChange('sites')
+    notifyDataChange('vetos')
   }
 
-  async function addFactor(input: FactorAssessment): Promise<number> {
-    const now = nowIso()
-    const record = toPlain({
-      ...input,
-      assessedAt: input.assessedAt || todayIso(),
-      createdAt: now,
-      updatedAt: now
-    }) as FactorAssessment
-    delete record.id
-    const id = await db.factors.add(record)
+  /**
+   * 追加因子评估。事务内重新读取库中最新一轮：
+   * 晚到且日期不更新时不覆盖，返回差异供页面确认；确认后作为历史补录保留。
+   */
+  async function addFactor(input: FactorAssessmentInput, force = false): Promise<AddFactorResult> {
+    const result = await addFactorAssessment(input, force)
     await load()
-    return id
+    if (result.outcome === 'added') notifyDataChange('factors')
+    return result
   }
 
   async function removeFactor(id: number): Promise<void> {
     await db.factors.delete(id)
     await load()
+    notifyDataChange('factors')
   }
 
   function byId(id: number | null | undefined): Campsite | null {
@@ -79,21 +98,27 @@ export const useSiteStore = defineStore('site', () => {
     return list.value.find((s) => s.id === id) ?? null
   }
 
-  /** 取某营位最新一条因子评估（按评估日期倒序）。 */
+  /** 取某营位最新一轮因子评估（按评估日期、同日期按提交次序倒序）。 */
   function latestFactor(siteId: number | null | undefined): FactorAssessment | null {
     if (siteId == null) return null
     const rows = factors.value
       .filter((f) => f.siteId === siteId)
-      .sort((a, b) => (a.assessedAt < b.assessedAt ? 1 : -1))
+      .sort((a, b) => compareAssessments(b, a))
     return rows[0] ?? null
   }
 
-  /** 取某营位全部因子评估（多轮复核对比用）。 */
+  /** 取某营位全部因子评估（按补录先后展示，旧记录仍可查）。 */
   function factorsOf(siteId: number | null | undefined): FactorAssessment[] {
     if (siteId == null) return []
-    return factors.value
-      .filter((f) => f.siteId === siteId)
-      .sort((a, b) => (a.assessedAt < b.assessedAt ? 1 : -1))
+    return [...factors.value.filter((f) => f.siteId === siteId)].sort((a, b) => {
+      const hasSequenceA = typeof a.sequence === 'number'
+      const hasSequenceB = typeof b.sequence === 'number'
+      if (hasSequenceA !== hasSequenceB) return hasSequenceA ? -1 : 1
+      if (hasSequenceA && hasSequenceB && a.sequence !== b.sequence) {
+        return a.sequence - b.sequence
+      }
+      return compareAssessments(a, b)
+    })
   }
 
   const camps = computed(() => Array.from(new Set(list.value.map((s) => s.campName))))

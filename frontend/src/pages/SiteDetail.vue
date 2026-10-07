@@ -18,7 +18,8 @@ import { FACTOR_META, NORMALIZE_LABELS } from '@/types/score'
 import { ASPECT_TYPES, SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
 import type { AspectType, AccessMode, SurfaceType } from '@/types/campsite'
 import type { Grade } from '@/utils/score'
-import type { RockfallRisk, WindDir, WindForce } from '@/types/factor'
+import type { FactorAssessmentInput, RockfallRisk, WindDir, WindForce } from '@/types/factor'
+import type { AddFactorResult } from '@/utils/db'
 import { ROCKFALL_RISKS, WIND_DIRS, WIND_FORCES } from '@/types/factor'
 import { VETO_TYPES, VETO_HINTS } from '@/types/veto'
 import type { VetoType } from '@/types/veto'
@@ -72,6 +73,12 @@ const factorForm = reactive({
   assessor: '',
   assessedAt: todayIso()
 })
+const factorConflict = ref<AddFactorResult | null>(null)
+const submittingFactor = ref(false)
+
+function clearFactorConflict(): void {
+  factorConflict.value = null
+}
 
 function prefillFactor(): void {
   const latest = siteStore.latestFactor(siteId.value)
@@ -88,31 +95,52 @@ function prefillFactor(): void {
     factorForm.assessor = latest.assessor
   }
   factorForm.assessedAt = todayIso()
+  clearFactorConflict()
 }
 
-async function submitFactor(): Promise<void> {
+function buildFactorInput(): FactorAssessmentInput {
+  return {
+    siteId: siteId.value,
+    waterDistance: Number(factorForm.waterDistance),
+    windDir: factorForm.windDir,
+    windForce: factorForm.windForce,
+    signalBars: Number(factorForm.signalBars),
+    sunHours: Number(factorForm.sunHours),
+    rockfallRisk: factorForm.rockfallRisk,
+    shade: Number(factorForm.shade),
+    distanceToCar: Number(factorForm.distanceToCar),
+    distanceToTrail: Number(factorForm.distanceToTrail),
+    assessor: factorForm.assessor.trim() || '未署名',
+    assessedAt: factorForm.assessedAt || todayIso()
+  }
+}
+
+async function submitFactor(force = false): Promise<void> {
   if (!site.value) return
+  submittingFactor.value = true
   try {
-    await siteStore.addFactor({
-      siteId: siteId.value,
-      waterDistance: Number(factorForm.waterDistance),
-      windDir: factorForm.windDir,
-      windForce: factorForm.windForce,
-      signalBars: Number(factorForm.signalBars),
-      sunHours: Number(factorForm.sunHours),
-      rockfallRisk: factorForm.rockfallRisk,
-      shade: Number(factorForm.shade),
-      distanceToCar: Number(factorForm.distanceToCar),
-      distanceToTrail: Number(factorForm.distanceToTrail),
-      assessor: factorForm.assessor.trim() || '未署名',
-      assessedAt: factorForm.assessedAt || todayIso(),
-      createdAt: '',
-      updatedAt: ''
-    })
-    showFactorForm.value = false
-    ElMessage.success('已追加一轮因子评估，名次与等级同步刷新')
+    const result = await siteStore.addFactor(buildFactorInput(), force)
+    if (result.outcome === 'added') {
+      showFactorForm.value = false
+      clearFactorConflict()
+      ElMessage.success(
+        result.changedLatest
+          ? '已追加最新评估，名次与等级已立即重算'
+          : '已作为历史补录留存，当前名次仍采用日期最新的评估'
+      )
+      return
+    }
+
+    factorConflict.value = result
+    if (result.outcome === 'duplicate') {
+      ElMessage.info('库中最新评估的日期与内容均相同，无需重复提交')
+    } else {
+      ElMessage.warning('库中最新评估的日期不早于本次提交，本次未覆盖；请核对差异后再决定是否留存')
+    }
   } catch (err) {
     ElMessage.error(`追加失败：${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    submittingFactor.value = false
   }
 }
 
@@ -512,13 +540,65 @@ watch(
             />
           </el-form-item>
         </div>
+        <el-alert
+          v-if="factorConflict"
+          class="factor-conflict"
+          :title="
+            factorConflict.outcome === 'duplicate'
+              ? '库中最新一轮内容与本次提交一致'
+              : '检测到同时提交：本次晚到且评估日期不更新，尚未覆盖'
+          "
+          type="warning"
+          show-icon
+          :closable="false"
+        >
+          <template #default>
+            <p class="factor-conflict__dates">
+              库中最新：{{ factorConflict.latest.assessedAt }} ·
+              {{ factorConflict.latest.assessor }}
+              ；本次：{{ factorForm.assessedAt }} ·
+              {{ factorForm.assessor.trim() || '未署名' }}
+            </p>
+            <el-table
+              v-if="factorConflict.differences.length"
+              :data="factorConflict.differences"
+              size="small"
+              border
+            >
+              <el-table-column prop="label" label="差异项" width="130" />
+              <el-table-column prop="latest" label="库中最新" min-width="120" />
+              <el-table-column prop="incoming" label="本次提交" min-width="120" />
+            </el-table>
+            <p v-else class="factor-conflict__empty">逐项数值没有差异，无需形成新的评估记录。</p>
+            <div v-if="factorConflict.outcome === 'stale'" class="factor-conflict__actions">
+              <span>
+                {{
+                  factorForm.assessedAt === factorConflict.latest.assessedAt
+                    ? '确认同日补录后，本次记录将成为最新评分。'
+                    : '旧日期记录会保留为历史补录，但评分仍以日期最新的一轮为准。'
+                }}
+              </span>
+              <el-button size="small" type="warning" plain :loading="submittingFactor" @click="submitFactor(true)">
+                确认差异并留存
+              </el-button>
+              <el-button size="small" @click="clearFactorConflict">取消</el-button>
+            </div>
+          </template>
+        </el-alert>
         <el-form-item>
-          <el-button type="primary" @click="submitFactor">提交本轮评估</el-button>
+          <el-button type="primary" :loading="submittingFactor" @click="submitFactor()">提交本轮评估</el-button>
         </el-form-item>
       </el-form>
 
       <el-table v-if="factorHistory.length" :data="factorHistory" size="small" border>
-        <el-table-column label="序号" width="64" type="index" />
+        <el-table-column label="轮次" width="150">
+          <template #default="{ row }">
+            第 {{ row.sequence }} 次
+            <el-tag v-if="siteStore.latestFactor(siteId)?.id === row.id" type="success" size="small">
+              当前评分
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="assessedAt" label="评估日期" width="118">
           <template #default="{ row }">{{ formatDate(row.assessedAt) }}</template>
         </el-table-column>
@@ -646,5 +726,20 @@ watch(
 }
 .review-form {
   margin-bottom: 12px;
+}
+.factor-conflict {
+  margin-bottom: 12px;
+}
+.factor-conflict__dates,
+.factor-conflict__empty {
+  margin: 6px 0 8px;
+}
+.factor-conflict__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--gb-muted);
 }
 </style>
